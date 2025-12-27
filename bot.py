@@ -1,528 +1,331 @@
 import os
 import logging
 import asyncio
-import time
-import hashlib
-from datetime import datetime, timedelta
-from pathlib import Path
-from typing import Dict, Any
 import aiohttp
 import aiofiles
-from tqdm.asyncio import tqdm
+import tempfile
+from pathlib import Path
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.constants import ParseMode
+import time
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, 
-    filters, ContextTypes, CallbackQueryHandler,
-    ConversationHandler
-)
-from telegram.constants import ParseMode, ChatAction
-
-from config import BOT_TOKEN, DOWNLOAD_PATH, MAX_FILE_SIZE, ALLOWED_EXTENSIONS, ADMIN_IDS
+# Import our downloader
 from terabox_downloader import TeraboxDownloader
 
 # Setup logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()
-    ]
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Conversation states
-SELECTING_ACTION, DOWNLOADING = range(2)
+# Your bot token
+BOT_TOKEN = "8546123786:AAFHdnlAYk2qu8lIr--yXmdJlELDWOQ-KRM"
 
-class TeraboxDownloadBot:
-    def __init__(self):
-        self.downloader = TeraboxDownloader()
-        self.user_stats: Dict[int, Dict[str, Any]] = {}
-        self.download_tasks: Dict[int, asyncio.Task] = {}
-        
-        # Ensure download directory exists
-        self.download_path = Path(DOWNLOAD_PATH)
-        self.download_path.mkdir(exist_ok=True)
-    
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /start command"""
-        user = update.effective_user
-        
-        # Initialize user stats
-        if user.id not in self.user_stats:
-            self.user_stats[user.id] = {
-                'downloads_today': 0,
-                'total_downloads': 0,
-                'last_download': None,
-                'start_date': datetime.now()
-            }
-        
-        welcome_text = f"""
-🤖 *Welcome to Terabox Downloader Bot* 🤖
+# Create downloader instance
+downloader = TeraboxDownloader()
 
-👋 Hello {user.first_name}!
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    await update.message.reply_html(
+        f"👋 Hello {user.mention_html()}!\n\n"
+        f"🤖 <b>Terabox Downloader Bot</b>\n\n"
+        f"📥 <b>Send me any Terabox link and I'll download it for you!</b>\n\n"
+        f"✅ <b>Supported:</b>\n"
+        f"• terabox.com\n"
+        f"• 1024terabox.com\n"
+        f"• terabox.app\n"
+        f"• dubox.com\n\n"
+        f"⚡ <b>Just paste a Terabox link and I'll handle the rest!</b>"
+    )
 
-📥 *Send me any Terabox link and I'll download it for you!*
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send a help message."""
+    help_text = """
+📖 <b>HOW TO USE:</b>
 
-✅ *Supported Links:*
-• terabox.com
-• dubox.com
-• terabox.app
+1. <b>Copy</b> any Terabox share link
+2. <b>Paste</b> it in this chat
+3. <b>Wait</b> for the bot to process
+4. <b>Receive</b> your downloaded file
 
-📁 *Supported Files:*
-• Videos (MP4, AVI, MKV, etc.)
-• Audio (MP3, WAV, etc.)
-• Images (JPG, PNG, GIF, etc.)
-• Documents (PDF, DOC, TXT, etc.)
-• Archives (ZIP, RAR, 7Z, etc.)
+⚠️ <b>Note:</b> Some files may require manual download if protected.
 
-⚡ *Features:*
-• Fast downloads
-• Progress updates
-• File size checking
-• Automatic format detection
+🔗 <b>Example link format:</b>
+https://terabox.com/s/XXXXX
+https://1024terabox.com/s/XXXXX
 
-⚠️ *Limitations:*
-• Max file size: 2GB
-• Rate limited to prevent abuse
-
-🛠 *Commands:*
+🛠 <b>Commands:</b>
 /start - Start the bot
-/help - Show help message
-/cancel - Cancel current operation
-/stats - Your download statistics
-/support - Get support
+/help - Show this help
+/status - Check bot status
+    """
+    await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
-🔗 *Just send me a Terabox link to get started!*
-        """
-        
-        keyboard = [
-            [InlineKeyboardButton("📖 How to Use", callback_data="help")],
-            [InlineKeyboardButton("⚠️ Limitations", callback_data="limits")],
-            [InlineKeyboardButton("🛠 Commands", callback_data="commands")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle incoming messages."""
+    user_message = update.message.text.strip()
+    
+    # Check if it's a Terabox URL
+    if downloader.is_terabox_url(user_message):
+        await process_terabox_link(update, user_message)
+    else:
         await update.message.reply_text(
-            welcome_text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=reply_markup
+            "❌ <b>Not a valid Terabox link!</b>\n\n"
+            "Please send a valid Terabox URL.\n"
+            "Example: <code>https://terabox.com/s/XXXXX</code>",
+            parse_mode=ParseMode.HTML
         )
+
+async def process_terabox_link(update: Update, url: str):
+    """Process Terabox link and download file."""
+    # Send processing message
+    processing_msg = await update.message.reply_text(
+        "🔍 <b>Processing your Terabox link...</b>\n"
+        "⏳ Please wait while I analyze the file...",
+        parse_mode=ParseMode.HTML
+    )
     
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle /help command"""
-        help_text = """
-📖 *HOW TO USE THIS BOT*
-
-1. *Find a Terabox link* - Get any shareable link from Terabox
-2. *Send the link* - Paste the link in chat
-3. *Wait for processing* - Bot will analyze the file
-4. *Confirm download* - Check file info and confirm
-5. *Receive file* - Bot will send you the downloaded file
-
-⚙️ *COMMANDS*
-
-/start - Start bot & show welcome
-/help - This help message
-/cancel - Cancel current operation
-/stats - Your download statistics
-/support - Contact support
-
-🔒 *PRIVACY & SAFETY*
-• Files are deleted immediately after sending
-• No logs of your downloads are kept
-• Your data is never shared
-• Bot only processes public links
-
-⚠️ *IMPORTANT NOTES*
-• Only download content you own or have permission for
-• Respect copyright laws
-• Large files may take time
-• Bot may be rate-limited
-• Use responsibly!
-
-📞 *SUPPORT*
-If you have issues:
-1. Check if link is valid
-2. Ensure file is under 2GB
-3. Try again in few minutes
-4. Contact admin for help
-
-*Ready to download? Just send me a Terabox link!*
-        """
+    try:
+        # Extract file information
+        file_info = downloader.extract_info(url)
         
-        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
-    
-    async def handle_link(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle incoming Terabox links"""
-        user = update.effective_user
-        message = update.message
-        
-        # Check if user is rate limited
-        if await self.is_rate_limited(user.id):
-            await message.reply_text(
-                "⏳ Please wait a moment before sending another link.\n"
-                "Rate limit: 1 request per minute."
+        if not file_info:
+            await processing_msg.edit_text(
+                "❌ <b>Failed to process link!</b>\n\n"
+                "Possible reasons:\n"
+                "• Link is private/restricted\n"
+                "• File doesn't exist\n"
+                "• Server error\n\n"
+                "Please check the link and try again.",
+                parse_mode=ParseMode.HTML
             )
             return
         
-        # Extract URL from message
-        text = message.text.strip()
+        # Get filename
+        filename = file_info.get('filename', f'terabox_file_{int(time.time())}')
         
-        # Validate it's a Terabox URL
-        if not self.downloader.is_valid_terabox_url(text):
-            await message.reply_text(
-                "❌ *Invalid Terabox Link!*\n\n"
-                "Please send a valid Terabox URL.\n"
-                "Example: `https://terabox.com/s/xxxxxxxxxx`",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
+        # Try to get direct download
+        download_info = downloader.get_direct_download(url)
         
-        # Send processing message
-        processing_msg = await message.reply_text(
-            "🔍 *Processing your link...*\n"
-            "⏳ Please wait while I analyze the file.",
-            parse_mode=ParseMode.MARKDOWN
+        if download_info and 'url' in download_info:
+            # We have a direct download URL
+            await start_download(update, processing_msg, download_info, filename)
+        else:
+            # No direct download available, show manual method
+            await show_manual_method(update, processing_msg, url, filename, file_info)
+            
+    except Exception as e:
+        logger.error(f"Error processing link: {str(e)}")
+        await processing_msg.edit_text(
+            f"❌ <b>Error occurred!</b>\n\n"
+            f"Error: {str(e)[:100]}\n\n"
+            f"Please try again later.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def start_download(update: Update, processing_msg, download_info, filename):
+    """Start downloading the file."""
+    try:
+        # Update message
+        await processing_msg.edit_text(
+            f"⬇️ <b>Downloading file...</b>\n\n"
+            f"📁 <b>File:</b> <code>{filename}</code>\n"
+            f"⏳ <b>Status:</b> Starting download...",
+            parse_mode=ParseMode.HTML
         )
         
-        try:
-            # Extract file information
-            file_info = self.downloader.extract_file_info(text)
-            
-            if not file_info:
-                await processing_msg.edit_text(
-                    "❌ *Unable to process link!*\n\n"
-                    "Possible reasons:\n"
-                    "• Link is private/restricted\n"
-                    "• File doesn't exist\n"
-                    "• Server error\n"
-                    "• Link format changed\n\n"
-                    "Please check the link and try again.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            # Check file size
-            file_size = file_info.get('size', 0)
-            if file_size > MAX_FILE_SIZE:
-                size_mb = file_size / (1024 * 1024)
-                max_mb = MAX_FILE_SIZE / (1024 * 1024)
-                await processing_msg.edit_text(
-                    f"❌ *File too large!*\n\n"
-                    f"File size: {size_mb:.1f} MB\n"
-                    f"Max allowed: {max_mb:.1f} MB\n\n"
-                    f"Please choose a smaller file.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
-            
-            # Prepare file info for user
-            filename = file_info.get('filename', 'Unknown')
-            size_str = self.format_size(file_size) if file_size else "Unknown"
-            
-            info_text = f"""
-✅ *File Found!*
-
-📁 *Filename:* `{filename}`
-📊 *Size:* {size_str}
-🔗 *Source:* Terabox
-
-📥 *Do you want to download this file?*
-            """
-            
-            keyboard = [
-                [
-                    InlineKeyboardButton("✅ Download", callback_data=f"download_{hash(text)}"),
-                    InlineKeyboardButton("❌ Cancel", callback_data="cancel")
-                ]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            # Store context for callback
-            context.user_data['current_link'] = text
-            context.user_data['file_info'] = file_info
-            context.user_data['processing_msg_id'] = processing_msg.message_id
-            
-            await processing_msg.edit_text(
-                info_text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=reply_markup
-            )
-            
-        except Exception as e:
-            logger.error(f"Error processing link: {str(e)}")
-            await processing_msg.edit_text(
-                f"❌ *Error processing link!*\n\n"
-                f"Error: {str(e)[:100]}\n\n"
-                f"Please try again later or contact support.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle button callbacks"""
-        query = update.callback_query
-        await query.answer()
+        # Create temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{filename}") as temp_file:
+            temp_path = temp_file.name
         
-        user = update.effective_user
-        data = query.data
+        # Download the file
+        download_url = download_info['url']
         
-        if data.startswith("download_"):
-            # Extract original link from user_data
-            original_link = context.user_data.get('current_link')
-            file_info = context.user_data.get('file_info')
-            
-            if not original_link or not file_info:
-                await query.edit_message_text("❌ Session expired. Please send link again.")
-                return
-            
-            # Start download
-            await self.start_download(user.id, original_link, file_info, query)
-            
-        elif data == "cancel":
-            await query.edit_message_text("❌ Download cancelled.")
-            if 'current_link' in context.user_data:
-                del context.user_data['current_link']
-            if 'file_info' in context.user_data:
-                del context.user_data['file_info']
-            
-        elif data == "help":
-            await self.help_command(update, context)
-        elif data == "limits":
-            await query.edit_message_text(
-                "⚠️ *LIMITATIONS*\n\n"
-                "• Max file size: 2GB\n"
-                "• Rate limit: 1 request/minute\n"
-                "• Supported formats only\n"
-                "• Public links only\n"
-                "• No password protected files",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        elif data == "commands":
-            await query.edit_message_text(
-                "🛠 *COMMANDS*\n\n"
-                "/start - Start bot\n"
-                "/help - Show help\n"
-                "/cancel - Cancel operation\n"
-                "/stats - Your stats\n"
-                "/support - Get help\n\n"
-                "*Just send a link to download!*",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    async def start_download(self, user_id: int, url: str, file_info: dict, query):
-        """Start download process"""
-        try:
-            # Update user stats
-            if user_id not in self.user_stats:
-                self.user_stats[user_id] = {
-                    'downloads_today': 0,
-                    'total_downloads': 0,
-                    'last_download': datetime.now(),
-                    'start_date': datetime.now()
-                }
-            
-            self.user_stats[user_id]['downloads_today'] += 1
-            self.user_stats[user_id]['total_downloads'] += 1
-            self.user_stats[user_id]['last_download'] = datetime.now()
-            
-            filename = file_info.get('filename', f"download_{int(time.time())}")
-            file_size = file_info.get('size', 0)
-            
-            # Create unique filename
-            unique_id = hashlib.md5(f"{url}_{time.time()}".encode()).hexdigest()[:8]
-            ext = self.get_file_extension(filename)
-            safe_filename = f"{unique_id}_{self.sanitize_filename(filename)}"
-            if ext and not safe_filename.endswith(ext):
-                safe_filename += ext
-            
-            download_path = self.download_path / safe_filename
-            
-            # Update message
-            await query.edit_message_text(
-                f"⬇️ *Downloading...*\n\n"
-                f"📁 *File:* `{filename}`\n"
-                f"📊 *Size:* {self.format_size(file_size)}\n"
-                f"⏳ *Status:* Starting download...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # Start download
-            task = asyncio.create_task(
-                self.download_file(url, download_path, query, file_info)
-            )
-            self.download_tasks[user_id] = task
-            
-            # Wait for download to complete
-            success = await task
-            
-            if success:
-                # Send file to user
-                await self.send_file_to_user(user_id, download_path, query, file_info)
-            else:
-                await query.edit_message_text(
-                    "❌ *Download failed!*\n\n"
-                    "Possible reasons:\n"
-                    "• Network error\n"
-                    "• File unavailable\n"
-                    "• Server blocked\n"
-                    "• Timeout\n\n"
-                    "Please try again later.",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            
-            # Cleanup
-            if download_path.exists():
-                try:
-                    download_path.unlink()
-                except:
-                    pass
-            
-            if user_id in self.download_tasks:
-                del self.download_tasks[user_id]
-                
-        except Exception as e:
-            logger.error(f"Error in download process: {str(e)}")
-            await query.edit_message_text(
-                f"❌ *Download error!*\n\n"
-                f"Error: {str(e)[:100]}\n\n"
-                f"Please try again.",
-                parse_mode=ParseMode.MARKDOWN
-            )
-    
-    async def download_file(self, url: str, path: Path, query, file_info: dict) -> bool:
-        """Download file with progress"""
-        try:
-            # Try to get direct download URL
-            direct_url = self.downloader.get_direct_download_url(url)
-            if not direct_url:
-                direct_url = url
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(direct_url, timeout=3600) as response:
-                    if response.status != 200:
-                        return False
-                    
-                    total_size = int(response.headers.get('content-length', 0))
+        # Use aiohttp for async download
+        async with aiohttp.ClientSession() as session:
+            async with session.get(download_url) as response:
+                if response.status == 200:
+                    total_size = 0
                     downloaded = 0
                     
-                    # Create progress message
-                    progress_msg = await query.message.reply_text(
-                        f"📥 *Download Progress*\n"
-                        f"📁 File: `{file_info.get('filename', 'Unknown')}`\n"
-                        f"📊 Size: {self.format_size(total_size)}\n"
-                        f"⏳ Status: Starting...\n"
-                        f"📈 Progress: 0%",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    # Get file size
+                    if 'content-length' in response.headers:
+                        total_size = int(response.headers['content-length'])
                     
                     # Download with progress
-                    chunk_size = 8192
-                    async with aiofiles.open(path, 'wb') as f:
-                        async for chunk in response.content.iter_chunked(chunk_size):
-                            if not chunk:
-                                break
-                            
+                    async with aiofiles.open(temp_path, 'wb') as f:
+                        async for chunk in response.content.iter_chunked(8192):
                             await f.write(chunk)
                             downloaded += len(chunk)
                             
-                            # Update progress every 5% or 5MB
-                            if total_size > 0:
+                            # Update progress every 1MB
+                            if total_size > 0 and downloaded % (1024 * 1024) < 8192:
                                 progress = (downloaded / total_size) * 100
-                                if downloaded % (5 * 1024 * 1024) < chunk_size or progress % 5 < 0.1:
-                                    try:
-                                        await progress_msg.edit_text(
-                                            f"📥 *Download Progress*\n"
-                                            f"📁 File: `{file_info.get('filename', 'Unknown')}`\n"
-                                            f"📊 Size: {self.format_size(total_size)}\n"
-                                            f"⏳ Status: Downloading...\n"
-                                            f"📈 Progress: {progress:.1f}%\n"
-                                            f"📥 Downloaded: {self.format_size(downloaded)} / {self.format_size(total_size)}",
-                                            parse_mode=ParseMode.MARKDOWN
-                                        )
-                                    except:
-                                        pass
+                                try:
+                                    await processing_msg.edit_text(
+                                        f"⬇️ <b>Downloading file...</b>\n\n"
+                                        f"📁 <b>File:</b> <code>{filename}</code>\n"
+                                        f"📊 <b>Progress:</b> {progress:.1f}%\n"
+                                        f"⏳ <b>Downloaded:</b> {downloaded / (1024*1024):.1f} MB",
+                                        parse_mode=ParseMode.HTML
+                                    )
+                                except:
+                                    pass
                     
-                    await progress_msg.edit_text(
-                        f"✅ *Download Complete!*\n"
-                        f"📁 File: `{file_info.get('filename', 'Unknown')}`\n"
-                        f"📊 Size: {self.format_size(total_size)}\n"
-                        f"⏱️ Status: Preparing to send...",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    # Send file to user
+                    await send_file_to_user(update, processing_msg, temp_path, filename)
                     
-                    return True
-                    
-        except Exception as e:
-            logger.error(f"Download error: {str(e)}")
-            return False
-    
-    async def send_file_to_user(self, user_id: int, path: Path, query, file_info: dict):
-        """Send downloaded file to user"""
-        try:
-            file_size = path.stat().st_size
-            filename = file_info.get('filename', path.name)
-            
-            # Determine file type for sending
-            ext = path.suffix.lower()
-            
-            # Update message
-            sending_msg = await query.message.reply_text(
-                f"📤 *Sending file...*\n\n"
-                f"📁 File: `{filename}`\n"
-                f"📊 Size: {self.format_size(file_size)}\n"
-                f"⏳ Please wait...",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # Send based on file type
-            try:
-                if ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp']:
-                    await query.message.reply_photo(
-                        photo=open(path, 'rb'),
-                        caption=f"📷 *Image Downloaded*\n\n📁 `{filename}`",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
-                elif ext in ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.m4a']:
-                    await query.message.reply_audio(
-                        audio=open(path, 'rb'),
-                        caption=f"🎵 *Audio Downloaded*\n\n📁 `{filename}`",
-                        parse_mode=ParseMode.MARKDOWN,
-                        title=filename
-                    )
-                elif ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv']:
-                    await query.message.reply_video(
-                        video=open(path, 'rb'),
-                        caption=f"🎥 *Video Downloaded*\n\n📁 `{filename}`",
-                        parse_mode=ParseMode.MARKDOWN,
-                        supports_streaming=True
-                    )
-                elif ext in ['.pdf', '.doc', '.docx', '.txt']:
-                    await query.message.reply_document(
-                        document=open(path, 'rb'),
-                        caption=f"📄 *Document Downloaded*\n\n📁 `{filename}`",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
                 else:
-                    await query.message.reply_document(
-                        document=open(path, 'rb'),
-                        caption=f"📁 *File Downloaded*\n\n📁 `{filename}`",
-                        parse_mode=ParseMode.MARKDOWN
+                    await processing_msg.edit_text(
+                        "❌ <b>Download failed!</b>\n\n"
+                        "Server returned error code. Please try again later.",
+                        parse_mode=ParseMode.HTML
                     )
-                
-                # Success message
-                await sending_msg.edit_text(
-                    f"✅ *File Sent Successfully!*\n\n"
-                    f"📁 File: `{filename}`\n"
-                    f"📊 Size: {self.format_size(file_size)}\n"
-                    f"🎉 Ready for next download!\n\n"
-                    f"Send another Terabox link when ready.",
-                    parse_mode=ParseMode.MARKDOWN
+        
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        
+    except Exception as e:
+        logger.error(f"Download error: {str(e)}")
+        await processing_msg.edit_text(
+            f"❌ <b>Download failed!</b>\n\n"
+            f"Error: {str(e)[:100]}\n\n"
+            f"Please try again or use manual method.",
+            parse_mode=ParseMode.HTML
+        )
+
+async def send_file_to_user(update: Update, processing_msg, file_path, filename):
+    """Send downloaded file to user."""
+    try:
+        file_size = os.path.getsize(file_path)
+        
+        # Determine file type
+        ext = os.path.splitext(filename)[1].lower()
+        
+        # Update message
+        await processing_msg.edit_text(
+            f"📤 <b>Sending file to you...</b>\n\n"
+            f"📁 <b>File:</b> <code>{filename}</code>\n"
+            f"📊 <b>Size:</b> {file_size / (1024*1024):.1f} MB\n"
+            f"⏳ Please wait...",
+            parse_mode=ParseMode.HTML
+        )
+        
+        # Send file based on type
+        with open(file_path, 'rb') as file:
+            if ext in ['.jpg', '.jpeg', '.png', '.gif']:
+                await update.message.reply_photo(
+                    photo=file,
+                    caption=f"📷 <b>Downloaded:</b> <code>{filename}</code>",
+                    parse_mode=ParseMode.HTML
                 )
-                
-            except Exception as e:
-                await sending_msg.edit_text(
-                    f"⚠️ *File too large for Telegram!*\n\n"
-                    f"File size: {self.format_size(file_size)}\n"
-                          
+            elif ext in ['.mp4', '.avi', '.mov', '.mkv']:
+                await update.message.reply_video(
+                    video=file,
+                    caption=f"🎥 <b>Downloaded:</b> <code>{filename}</code>",
+                    parse_mode=ParseMode.HTML,
+                    supports_streaming=True
+                )
+            elif ext in ['.mp3', '.wav', '.flac']:
+                await update.message.reply_audio(
+                    audio=file,
+                    caption=f"🎵 <b>Downloaded:</b> <code>{filename}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+            else:
+                await update.message.reply_document(
+                    document=file,
+                    caption=f"📁 <b>Downloaded:</b> <code>{filename}</code>",
+                    parse_mode=ParseMode.HTML
+                )
+        
+        # Success message
+        await processing_msg.edit_text(
+            f"✅ <b>File sent successfully!</b>\n\n"
+            f"📁 <b>File:</b> <code>{filename}</code>\n"
+            f"📊 <b>Size:</b> {file_size / (1024*1024):.1f} MB\n"
+            f"🎉 <b>Ready for next download!</b>",
+            parse_mode=ParseMode.HTML
+        )
+        
+    except Exception as e:
+        logger.error(f"Error sending file: {str(e)}")
+        await processing_msg.edit_text(
+            f"⚠️ <b>File too large for Telegram!</b>\n\n"
+            f"Telegram has file size limits.\n"
+            f"File saved at: <code>{file_path}</code>",
+            parse_mode=ParseMode.HTML
+        )
+
+async def show_manual_method(update: Update, processing_msg, url, filename, file_info):
+    """Show manual download method when direct download fails."""
+    manual_text = f"""
+⚠️ <b>Direct Download Not Available</b>
+
+📁 <b>File:</b> <code>{filename}</code>
+
+🔗 <b>Original Link:</b>
+<code>{url}</code>
+
+📋 <b>Manual Download Method:</b>
+
+1. <b>Open link</b> in browser
+2. <b>Wait</b> for page to load
+3. Look for <b>download button</b>
+4. Click to download manually
+
+💡 <b>Tip:</b> Some Terabox files require login or have download restrictions.
+
+🔄 You can try sending the link again in a few minutes.
+    """
+    
+    await processing_msg.edit_text(manual_text, parse_mode=ParseMode.HTML)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check bot status."""
+    await update.message.reply_text(
+        "✅ <b>Bot Status: Running</b>\n\n"
+        "🤖 <b>Terabox Downloader Bot</b>\n"
+        "🟢 <b>Online</b>\n"
+        "📥 <b>Ready to download</b>\n\n"
+        "Send me any Terabox link to get started!",
+        parse_mode=ParseMode.HTML
+    )
+
+def main():
+    """Start the bot."""
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add command handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("status", status_command))
+    
+    # Add message handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Log errors
+    application.add_error_handler(lambda u, c: logger.error(c.error) if c.error else None)
+    
+    # Start bot
+    logger.info("🤖 Starting Terabox Downloader Bot...")
+    print("\n" + "="*50)
+    print("TERABOX DOWNLOADER BOT")
+    print("="*50)
+    print("🚀 Bot is running!")
+    print("📱 Send /start to begin")
+    print("🔗 Paste any Terabox link to download")
+    print("="*50)
+    
+    # Run bot
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
