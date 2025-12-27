@@ -282,8 +282,10 @@ If you have issues:
             
         elif data == "cancel":
             await query.edit_message_text("❌ Download cancelled.")
-            del context.user_data['current_link']
-            del context.user_data['file_info']
+            if 'current_link' in context.user_data:
+                del context.user_data['current_link']
+            if 'file_info' in context.user_data:
+                del context.user_data['file_info']
             
         elif data == "help":
             await self.help_command(update, context)
@@ -523,6 +525,4 @@ If you have issues:
                 await sending_msg.edit_text(
                     f"⚠️ *File too large for Telegram!*\n\n"
                     f"File size: {self.format_size(file_size)}\n"
-                    f"Telegram limit: 2GB\n\n"
-                    f"Download link: `{str(path.absolute())}`",
-            
+                          
